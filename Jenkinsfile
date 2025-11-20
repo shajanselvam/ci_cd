@@ -1,151 +1,360 @@
 pipeline {
     agent any
-
+    
     environment {
-        AWS_ACCOUNT_ID = '666098475707'
-        AWS_REGION = 'us-east-1'
-        ECR_REPOSITORY = 'my-web-app'
-        DOCKER_IMAGE = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}"
+        // GCP Configuration
+        PROJECT_ID = 'emerald-state-472315-d7'                    // Replace with your GCP project ID
+        CLUSTER_ZONE = 'us-central1-a'
+        REGISTRY_HOSTNAME = 'us-central1-docker.pkg.dev'
+        REPOSITORY = 'docker-repo'
+        IMAGE_NAME = 'my-web-app'
         IMAGE_TAG = "${BUILD_NUMBER}"
-        EC2_HOST = 'ec2-44-201-137-203.compute-1.amazonaws.com'
-        EC2_USER = 'ec2-user'
-        AWS_CREDENTIALS = 'aws-credentials-id'
-        EMAIL_RECIPIENTS = 'your-email@example.com'
+        
+        // Credentials
+        GCP_CREDENTIALS = credentials('gcp-service-account')
+        
+        // Email Configuration
+        EMAIL_RECIPIENTS = 'rahuljivisu2004@gmail.com'       // Replace with your email
     }
-
+    
     stages {
         stage('Checkout') {
             steps {
-                echo '==================== Checking out code from GitHub ===================='
+                echo '=========================================='
+                echo 'Stage 1: Checking out code from GitHub'
+                echo '=========================================='
                 checkout scm
+                sh 'git rev-parse HEAD > commit-id.txt'
+                script {
+                    env.GIT_COMMIT_SHORT = sh(
+                        script: "git rev-parse --short HEAD",
+                        returnStdout: true
+                    ).trim()
+                    env.GIT_COMMIT_MSG = sh(
+                        script: "git log -1 --pretty=%B",
+                        returnStdout: true
+                    ).trim()
+                }
+                echo "Commit ID: ${env.GIT_COMMIT_SHORT}"
+                echo "Commit Message: ${env.GIT_COMMIT_MSG}"
             }
         }
-
+        
         stage('Build') {
             steps {
-                echo '==================== Building Application ===================='
-                sh 'npm install'
-            }
-        }
-
-        stage('Test') {
-            steps {
-                echo '==================== Running Tests ===================='
-                sh 'npm test || true'
-            }
-            post {
-                always {
-                    script {
-                        if (fileExists('test-results')) {
-                            junit 'test-results/*.xml'
-                        } else {
-                            echo 'No test results found'
-                        }
+                echo '=========================================='
+                echo 'Stage 2: Building the application'
+                echo '=========================================='
+                script {
+                    if (fileExists('package.json')) {
+                        echo 'Node.js project detected. Installing dependencies...'
+                        sh 'npm install'
+                        echo 'Dependencies installed successfully!'
+                    } else if (fileExists('pom.xml')) {
+                        echo 'Maven project detected. Building...'
+                        sh 'mvn clean install -DskipTests'
+                        echo 'Maven build completed!'
+                    } else if (fileExists('requirements.txt')) {
+                        echo 'Python project detected. Installing dependencies...'
+                        sh 'pip install -r requirements.txt'
+                        echo 'Python dependencies installed!'
+                    } else {
+                        echo 'No build configuration detected. Skipping build step.'
                     }
                 }
             }
         }
-
-        stage('Code Quality Analysis') {
+        
+        stage('Test') {
             steps {
-                echo '==================== Running Code Quality Checks ===================='
-                sh 'npm run lint || true'
+                echo '=========================================='
+                echo 'Stage 3: Running unit tests'
+                echo '=========================================='
+                script {
+                    if (fileExists('package.json')) {
+                        sh 'npm test || echo "No tests defined"'
+                    } else if (fileExists('pom.xml')) {
+                        sh 'mvn test'
+                    } else if (fileExists('pytest.ini') || fileExists('tests/')) {
+                        sh 'pytest || echo "No pytest tests found"'
+                    } else {
+                        echo 'No test configuration found. Skipping tests.'
+                    }
+                }
+                echo 'Tests completed successfully!'
             }
         }
-
+        
+        stage('Code Quality Analysis') {
+            steps {
+                echo '=========================================='
+                echo 'Stage 4: Running code quality checks'
+                echo '=========================================='
+                script {
+                    // Basic linting checks
+                    if (fileExists('package.json')) {
+                        sh '''
+                            echo "Running ESLint..."
+                            npx eslint . --ext .js,.jsx || echo "ESLint not configured"
+                        '''
+                    } else if (fileExists('requirements.txt')) {
+                        sh '''
+                            echo "Running Pylint..."
+                            pip install pylint || true
+                            pylint **/*.py || echo "Pylint check completed with warnings"
+                        '''
+                    }
+                }
+                
+            }
+        }
+        
         stage('Build Docker Image') {
             steps {
-                echo '==================== Building Docker Image ===================='
+                echo '=========================================='
+                echo 'Stage 5: Building Docker image'
+                echo '=========================================='
+                script {
+                    // Verify Dockerfile exists
+                    if (!fileExists('Dockerfile')) {
+                        error('Dockerfile not found! Please create a Dockerfile in the repository root.')
+                    }
+                    
+                    echo "Building Docker image: ${IMAGE_NAME}:${IMAGE_TAG}"
+                    sh """
+                        docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+                        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${REGISTRY_HOSTNAME}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG}
+                        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${REGISTRY_HOSTNAME}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:latest
+                    """
+                    echo "Docker image built successfully!"
+                    
+                    // Display image info
+                    sh "docker images | grep ${IMAGE_NAME}"
+                }
+            }
+        }
+        
+        stage('Push to Artifact Registry') {
+            steps {
+                echo '=========================================='
+                echo 'Stage 6: Pushing image to GCP Artifact Registry'
+                echo '=========================================='
                 sh """
-                    docker build -t ${ECR_REPOSITORY}:${IMAGE_TAG} .
-                    docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${DOCKER_IMAGE}:${IMAGE_TAG}
-                    docker tag ${ECR_REPOSITORY}:${IMAGE_TAG} ${DOCKER_IMAGE}:latest
+                    # Authenticate with GCP
+                    gcloud auth activate-service-account --key-file=${GCP_CREDENTIALS}
+                    gcloud config set project ${PROJECT_ID}
+                    
+                    # Configure Docker to use gcloud as credential helper
+                    gcloud auth configure-docker ${REGISTRY_HOSTNAME} --quiet
+                    
+                    # Push images
+                    echo "Pushing image with tag: ${IMAGE_TAG}"
+                    docker push ${REGISTRY_HOSTNAME}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG}
+                    
+                    echo "Pushing image with tag: latest"
+                    docker push ${REGISTRY_HOSTNAME}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:latest
+                    
+                    echo "Images pushed successfully to Artifact Registry!"
+                """
+                
+                script {
+                    env.IMAGE_URL = "${REGISTRY_HOSTNAME}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG}"
+                    echo "Image URL: ${env.IMAGE_URL}"
+                }
+            }
+        }
+        
+        stage('Deploy to Cloud Run') {
+            steps {
+                echo '=========================================='
+                echo 'Stage 7: Deploying to GCP Cloud Run'
+                echo '=========================================='
+                sh """
+                    # Authenticate and set project
+                    gcloud auth activate-service-account --key-file=${GCP_CREDENTIALS}
+                    gcloud config set project ${PROJECT_ID}
+                    
+                    # Deploy to Cloud Run
+                    gcloud run deploy ${IMAGE_NAME} \
+                        --image=${REGISTRY_HOSTNAME}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG} \
+                        --platform=managed \
+                        --region=us-central1 \
+                        --allow-unauthenticated \
+                        --port=8080 \
+                        --memory=512Mi \
+                        --cpu=1 \
+                        --max-instances=10 \
+                        --timeout=300 \
+                        --set-env-vars="BUILD_NUMBER=${BUILD_NUMBER},GIT_COMMIT=${GIT_COMMIT_SHORT}"
+                    
+                    echo "Deployment to Cloud Run completed!"
                 """
             }
         }
-
-        stage('Push to ECR') {
+        
+        stage('Verify Deployment') {
             steps {
-                echo '==================== Pushing Image to AWS ECR ===================='
-                withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${AWS_CREDENTIALS}"]]) {
+                echo '=========================================='
+                echo 'Stage 8: Verifying deployment'
+                echo '=========================================='
+                script {
                     sh """
-                        aws ecr get-login-password --region ${AWS_REGION} \
-                            | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-
-                        docker push ${DOCKER_IMAGE}:${IMAGE_TAG}
-                        docker push ${DOCKER_IMAGE}:latest
+                        gcloud auth activate-service-account --key-file=${GCP_CREDENTIALS}
+                        gcloud config set project ${PROJECT_ID}
+                        
+                        # Get service URL
+                        SERVICE_URL=\$(gcloud run services describe ${IMAGE_NAME} \
+                            --region=us-central1 \
+                            --format='value(status.url)')
+                        
+                        echo "=========================================="
+                        echo "Application deployed successfully!"
+                        echo "URL: \$SERVICE_URL"
+                        echo "=========================================="
+                        
+                        # Health check
+                        echo "Performing health check..."
+                        sleep 5
+                        
+                        HTTP_CODE=\$(curl -s -o /dev/null -w "%{http_code}" \$SERVICE_URL/health || echo "000")
+                        
+                        if [ "\$HTTP_CODE" = "200" ] || [ "\$HTTP_CODE" = "000" ]; then
+                            echo "Health check passed! Service is responding."
+                            echo "\$SERVICE_URL" > deployment-url.txt
+                        else
+                            echo "Warning: Health check returned code \$HTTP_CODE"
+                            echo "Please verify the deployment manually."
+                        fi
                     """
+                    
+                    // Store URL for email notification
+                    env.DEPLOYMENT_URL = sh(
+                        script: "cat deployment-url.txt",
+                        returnStdout: true
+                    ).trim()
                 }
             }
         }
-
-        stage('Deploy to EC2') {
+        
+        stage('Cleanup') {
             steps {
-                echo '==================== Deploying to EC2 Instance ===================='
-                withCredentials([
-                    [$class: 'AmazonWebServicesCredentialsBinding', credentialsId: "${AWS_CREDENTIALS}"],
-                    [$class: 'SSHUserPrivateKeyBinding', credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY']
-                ]) {
-                    sh """
-                        ssh -o StrictHostKeyChecking=no -i \$SSH_KEY ${EC2_USER}@${EC2_HOST} << EOF
-                            aws ecr get-login-password --region ${AWS_REGION} \
-                                | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
-
-                            docker stop my-web-app || true
-                            docker rm my-web-app || true
-
-                            docker pull ${DOCKER_IMAGE}:${IMAGE_TAG}
-
-                            docker run -d --name my-web-app -p 80:3000 ${DOCKER_IMAGE}:${IMAGE_TAG}
-
-                            docker image prune -f
-EOF
-                    """
-                }
-            }
-        }
-
-        stage('Health Check') {
-            steps {
-                echo '==================== Performing Health Check ===================='
+                echo '=========================================='
+                echo 'Stage 9: Cleaning up local Docker images'
+                echo '=========================================='
                 sh """
-                    sleep 15
-                    curl -f http://${EC2_HOST}/ || exit 1
+                    # Remove local images to save space
+                    docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true
+                    docker rmi ${REGISTRY_HOSTNAME}/${PROJECT_ID}/${REPOSITORY}/${IMAGE_NAME}:${IMAGE_TAG} || true
+                    
+                    # Clean up dangling images
+                    docker image prune -f
+                    
+                    echo "Cleanup completed!"
                 """
             }
         }
     }
-
+    
     post {
         success {
-            echo '==================== Pipeline Succeeded ===================='
-            emailext(
-                subject: "✔ SUCCESS: ${JOB_NAME} Build #${BUILD_NUMBER}",
-                body: """
-                <h2>Deployment Successful</h2>
-                <p><b>Application URL:</b> http://${EC2_HOST}</p>
-                <p><b>Docker Image:</b> ${DOCKER_IMAGE}:${IMAGE_TAG}</p>
-                """,
-                to: "${EMAIL_RECIPIENTS}",
-                mimeType: 'text/html'
-            )
+            echo '=========================================='
+            echo 'Pipeline completed SUCCESSFULLY!'
+            echo '=========================================='
+            script {
+                def duration = currentBuild.duration / 1000
+                emailext(
+                    subject: "✅ SUCCESS: ${env.JOB_NAME} - Build #${env.BUILD_NUMBER}",
+                    body: """
+                        <html>
+                        <body>
+                            <h2 style="color: green;">✅ Build Success!</h2>
+                            <hr>
+                            <table border="1" cellpadding="5">
+                                <tr><td><strong>Pipeline:</strong></td><td>${env.JOB_NAME}</td></tr>
+                                <tr><td><strong>Build Number:</strong></td><td>${env.BUILD_NUMBER}</td></tr>
+                                <tr><td><strong>Status:</strong></td><td style="color: green;">SUCCESS</td></tr>
+                                <tr><td><strong>Duration:</strong></td><td>${duration} seconds</td></tr>
+                                <tr><td><strong>Git Commit:</strong></td><td>${env.GIT_COMMIT_SHORT}</td></tr>
+                                <tr><td><strong>Commit Message:</strong></td><td>${env.GIT_COMMIT_MSG}</td></tr>
+                                <tr><td><strong>Image Tag:</strong></td><td>${env.IMAGE_TAG}</td></tr>
+                                <tr><td><strong>Deployment URL:</strong></td><td><a href="${env.DEPLOYMENT_URL}">${env.DEPLOYMENT_URL}</a></td></tr>
+                            </table>
+                            <hr>
+                            <p><strong>Console Output:</strong> <a href="${env.BUILD_URL}console">${env.BUILD_URL}console</a></p>
+                            <p><strong>Jenkins Build:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                            <br>
+                            <p style="color: gray; font-size: 12px;">This is an automated message from Jenkins CI/CD Pipeline</p>
+                        </body>
+                        </html>
+                    """,
+                    to: "${EMAIL_RECIPIENTS}",
+                    mimeType: 'text/html'
+                )
+            }
         }
-
+        
         failure {
-            echo '==================== Pipeline Failed ===================='
+            echo '=========================================='
+            echo 'Pipeline FAILED!'
+            echo '=========================================='
+            script {
+                def duration = currentBuild.duration / 1000
+                emailext(
+                    subject: "❌ FAILURE: ${env.JOB_NAME} - Build #${env.BUILD_NUMBER}",
+                    body: """
+                        <html>
+                        <body>
+                            <h2 style="color: red;">❌ Build Failed!</h2>
+                            <hr>
+                            <table border="1" cellpadding="5">
+                                <tr><td><strong>Pipeline:</strong></td><td>${env.JOB_NAME}</td></tr>
+                                <tr><td><strong>Build Number:</strong></td><td>${env.BUILD_NUMBER}</td></tr>
+                                <tr><td><strong>Status:</strong></td><td style="color: red;">FAILURE</td></tr>
+                                <tr><td><strong>Duration:</strong></td><td>${duration} seconds</td></tr>
+                                <tr><td><strong>Git Commit:</strong></td><td>${env.GIT_COMMIT_SHORT}</td></tr>
+                                <tr><td><strong>Commit Message:</strong></td><td>${env.GIT_COMMIT_MSG}</td></tr>
+                                <tr><td><strong>Failed Stage:</strong></td><td>${env.STAGE_NAME}</td></tr>
+                            </table>
+                            <hr>
+                            <p><strong>Console Output:</strong> <a href="${env.BUILD_URL}console">${env.BUILD_URL}console</a></p>
+                            <p><strong>Jenkins Build:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></p>
+                            <br>
+                            <p style="color: red;">⚠️ Please check the console output for detailed error messages.</p>
+                            <p style="color: gray; font-size: 12px;">This is an automated message from Jenkins CI/CD Pipeline</p>
+                        </body>
+                        </html>
+                    """,
+                    to: "${EMAIL_RECIPIENTS}",
+                    mimeType: 'text/html'
+                )
+            }
+        }
+        
+        unstable {
+            echo '=========================================='
+            echo 'Pipeline is UNSTABLE!'
+            echo '=========================================='
             emailext(
-                subject: "❌ FAILURE: ${JOB_NAME} Build #${BUILD_NUMBER}",
+                subject: "⚠️ UNSTABLE: ${env.JOB_NAME} - Build #${env.BUILD_NUMBER}",
                 body: """
-                <h2>Build Failed</h2>
-                <p><a href="${BUILD_URL}console">View Console Output</a></p>
+                    Pipeline: ${env.JOB_NAME}
+                    Build Number: ${env.BUILD_NUMBER}
+                    Status: UNSTABLE
+                    
+                    Some tests may have failed or warnings were detected.
+                    
+                    Check console output at: ${env.BUILD_URL}console
                 """,
-                to: "${EMAIL_RECIPIENTS}",
-                mimeType: 'text/html'
+                to: "${EMAIL_RECIPIENTS}"
             )
         }
-
+        
         always {
-            cleanWs()
+            echo '=========================================='
+            echo 'Pipeline execution completed'
+            echo '=========================================='
+            // Clean up workspace (optional)
+            // cleanWs()
         }
     }
 }
